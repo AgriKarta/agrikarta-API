@@ -30,6 +30,31 @@ create table if not exists bahan_baku (
   updated_at timestamptz not null default now()
 );
 
+create table if not exists factory_center (
+  id smallint primary key default 1 check (id = 1),
+  latitude double precision not null,
+  longitude double precision not null,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+insert into factory_center (id, latitude, longitude)
+values (1, -6.2088, 106.8456)
+on conflict (id) do nothing;
+
+create table if not exists zona_sla (
+  zona smallint primary key check (zona between 1 and 4),
+  tenggat_jam smallint not null check (tenggat_jam > 0)
+);
+
+insert into zona_sla (zona, tenggat_jam)
+values
+  (1, 2),
+  (2, 4),
+  (3, 6),
+  (4, 6)
+on conflict (zona) do nothing;
+
 create table if not exists pengiriman (
   id bigserial primary key,
   pengepul_id uuid not null references profiles (id) on delete restrict,
@@ -95,8 +120,8 @@ $$;
 create or replace function calculate_user_zona(
   user_lat double precision,
   user_lon double precision,
-  factory_lat double precision default -6.2088,
-  factory_lon double precision default 106.8456
+  factory_lat double precision,
+  factory_lon double precision
 )
 returns smallint
 language plpgsql
@@ -134,8 +159,20 @@ create or replace function set_profiles_zona()
 returns trigger
 language plpgsql
 as $$
+declare
+  center_lat double precision;
+  center_lon double precision;
 begin
-  new.zona := calculate_user_zona(new.latitude, new.longitude);
+  select fc.latitude, fc.longitude
+  into center_lat, center_lon
+  from factory_center fc
+  where fc.id = 1;
+
+  if center_lat is null or center_lon is null then
+    raise exception 'Factory center coordinate not configured';
+  end if;
+
+  new.zona := calculate_user_zona(new.latitude, new.longitude, center_lat, center_lon);
   return new;
 end;
 $$;
@@ -146,7 +183,7 @@ language plpgsql
 as $$
 declare
   assigned_zona smallint;
-  base_time timestamptz;
+  deadline_hours smallint;
 begin
   select p.zona into assigned_zona
   from profiles p
@@ -156,14 +193,15 @@ begin
     raise exception 'Pengepul profile % not found or missing zona', new.pengepul_id;
   end if;
 
-  base_time := coalesce(new.created_at, now());
+  select zs.tenggat_jam into deadline_hours
+  from zona_sla zs
+  where zs.zona = assigned_zona;
 
-  new.tenggat_waktu_kirim := base_time
-    + case
-      when assigned_zona = 1 then interval '2 hours'
-      when assigned_zona = 2 then interval '4 hours'
-      else interval '6 hours'
-    end;
+  if deadline_hours is null then
+    raise exception 'No SLA deadline configured for zona %', assigned_zona;
+  end if;
+
+  new.tenggat_waktu_kirim := now() + make_interval(hours => deadline_hours);
 
   return new;
 end;
@@ -184,6 +222,11 @@ before update on bahan_baku
 for each row
 execute function set_updated_at();
 
+create trigger trg_factory_center_set_updated_at
+before update on factory_center
+for each row
+execute function set_updated_at();
+
 create trigger trg_pengiriman_set_updated_at
 before update on pengiriman
 for each row
@@ -194,7 +237,7 @@ before insert or update of pengepul_id on pengiriman
 for each row
 execute function set_pengiriman_tenggat_waktu();
 
-create or replace function cancel_overdue_pengiriman()
+create or replace function public.cancel_overdue_pengiriman()
 returns void
 language plpgsql
 as $$
