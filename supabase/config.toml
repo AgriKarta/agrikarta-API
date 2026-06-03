@@ -1,0 +1,4 @@
+project_id = "agrikarta-api"
+
+[functions.payment-callback]
+verify_jwt = false
